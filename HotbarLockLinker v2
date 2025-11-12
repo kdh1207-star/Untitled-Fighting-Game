@@ -1,0 +1,286 @@
+-- HotbarLockLinker v2 — StarterPlayerScripts
+-- 목적: "핫바 잠금" ↔ PlayerGui.Backpack(ScreenGui).Enabled 양방향 연동
+--  - Enabled=false  => 잠금 ON (입력 차단 + 강제 Unequip)
+--  - Enabled=true   => 잠금 OFF
+--  - 외부 제어: script.HotbarLock:Fire(true|false) 또는 Humanoid:SetAttribute("HotbarLocked", bool)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ContextActionService = game:GetService("ContextActionService")
+local StarterGui = game:GetService("StarterGui")
+
+local LOCAL = Players.LocalPlayer
+
+-- ========= 유틸: 캐릭터/휴머노이드 =========
+local function getCharacter()
+	return LOCAL.Character or LOCAL.CharacterAdded:Wait()
+end
+
+local function getHumanoid()
+	return getCharacter():WaitForChild("Humanoid")
+end
+
+-- ========= GUI 핸들 탐색(탄탄하게) =========
+-- ScreenGui 이름이 "Backpack"이 아니라면 framePath/sgName 수정해서 써라.
+local SG_NAME = "Backpack"      -- ScreenGui
+local INNER_NAME = "Backpack"   -- 내부 Frame(있으면 Visible도 따라감)
+
+local function waitPlayerGui(timeout)
+	timeout = timeout or 10
+	local pg = LOCAL:FindFirstChild("PlayerGui")
+	local t0 = time()
+	while not pg and time() - t0 < timeout do
+		LOCAL.ChildAdded:Wait()
+		pg = LOCAL:FindFirstChild("PlayerGui")
+	end
+	return pg
+end
+
+local function getGuiHandles(timeout)
+	local pg = waitPlayerGui(timeout or 10)
+	if not pg then return nil, nil end
+	local sg = pg:FindFirstChild(SG_NAME)
+	if not sg then
+		-- 생성을 기다림
+		local t0 = time()
+		while not sg and time() - t0 < 10 do
+			pg.ChildAdded:Wait()
+			sg = pg:FindFirstChild(SG_NAME)
+		end
+	end
+	if not sg then return nil, nil end
+	local inner = sg:FindFirstChild(INNER_NAME)
+	return sg, inner
+end
+
+-- ========= 외부 제어 이벤트/어트리뷰트 =========
+local HotbarLock = script:FindFirstChild("HotbarLock")
+if not HotbarLock then
+	HotbarLock = Instance.new("BindableEvent")
+	HotbarLock.Name = "HotbarLock"
+	HotbarLock.Parent = script
+end
+
+-- ========= 잠금 가드(입력 차단 + 강제 Unequip + 실시간 회수) =========
+local guardActive = false
+local ignoreGuiChange = false
+local GUARD_ACTION_PREFIX = "HBLOCK_"
+local GUARD_STEP = "HBLOCK_RenderGuard"
+local conns = {}
+
+local function clearConns()
+	for _, c in ipairs(conns) do
+		if c then c:Disconnect() end
+	end
+	table.clear(conns)
+end
+
+local function blockInput(_, state)
+	if state == Enum.UserInputState.Begin then
+		return Enum.ContextActionResult.Sink
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+local function bindInputs()
+	local keys = {
+		Enum.KeyCode.Zero, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
+		Enum.KeyCode.Five, Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine,
+		Enum.KeyCode.Backspace, Enum.KeyCode.Equals, Enum.KeyCode.Minus,
+		Enum.KeyCode.E, Enum.KeyCode.Q
+	}
+	for i, key in ipairs(keys) do
+		ContextActionService:BindActionAtPriority(
+			GUARD_ACTION_PREFIX..i,
+			blockInput,
+			false,
+			Enum.ContextActionPriority.High.Value,
+			key
+		)
+	end
+end
+
+local function unbindInputs()
+	for i = 1, 40 do
+		ContextActionService:UnbindAction(GUARD_ACTION_PREFIX..i)
+	end
+end
+
+local function forceUnequipAll()
+	local hum = getHumanoid()
+	pcall(function() hum:UnequipTools() end)
+	local backpack = LOCAL:WaitForChild("Backpack")
+	local char = hum.Parent
+	for _, ch in ipairs(char:GetChildren()) do
+		if ch:IsA("Tool") then
+			pcall(function() ch:Deactivate() end)
+			ch.Parent = backpack
+		end
+	end
+end
+
+local function attachRealtimeGuards()
+	clearConns()
+	local hum = getHumanoid()
+	local char = hum.Parent
+	local backpack = LOCAL:WaitForChild("Backpack")
+
+	table.insert(conns, char.ChildAdded:Connect(function(inst)
+		if guardActive and inst:IsA("Tool") then
+			task.defer(function()
+				if inst.Parent == char then forceUnequipAll() end
+			end)
+		end
+	end))
+
+	table.insert(conns, char.DescendantAdded:Connect(function(inst)
+		if guardActive and inst:IsA("Tool") then
+			task.defer(function()
+				if inst.Parent == char then forceUnequipAll() end
+			end)
+		end
+	end))
+
+	table.insert(conns, backpack.ChildRemoved:Connect(function(inst)
+		if guardActive and inst and inst:IsA("Tool") then
+			task.defer(function()
+				if inst.Parent == char then forceUnequipAll() end
+			end)
+		end
+	end))
+end
+
+local function startGuard()
+	if guardActive then return end
+	guardActive = true
+
+	-- PlayerGui.Backpack.Enabled = false 로 ‘표시’도 끔
+	local sg = select(1, getGuiHandles(2))
+	if sg and sg.Enabled ~= false then
+		ignoreGuiChange = true
+		sg.Enabled = false
+		ignoreGuiChange = false
+	end
+
+	-- (선택) CoreGui 백팩도 같이 끄고 싶으면 유지
+	pcall(function()
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+	end)
+
+	bindInputs()
+	attachRealtimeGuards()
+	forceUnequipAll()
+
+	RunService:BindToRenderStep(GUARD_STEP, Enum.RenderPriority.Input.Value + 100, function()
+		if guardActive then
+			forceUnequipAll()
+		end
+	end)
+
+	-- 상태 플래그(옵션): 휴머노이드 Attribute로 노출
+	pcall(function() getHumanoid():SetAttribute("HotbarLocked", true) end)
+end
+
+local function stopGuard()
+	if not guardActive then return end
+	guardActive = false
+
+	unbindInputs()
+	clearConns()
+	pcall(function() RunService:UnbindFromRenderStep(GUARD_STEP) end)
+
+	-- (선택) CoreGui 복구 원하면 주석 해제
+	-- pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true) end)
+
+	pcall(function() getHumanoid():SetAttribute("HotbarLocked", false) end)
+end
+
+-- ========= GUI 변화 ↔ 잠금 상태 양방향 연결 =========
+local function hookGuiSignals()
+	local sg, inner = getGuiHandles(10)
+	if not sg then return end
+
+	-- ScreenGui.Enabled 변경 시 → 잠금 토글
+	sg:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if ignoreGuiChange then return end
+		if sg.Enabled == false then
+			startGuard()
+		else
+			stopGuard()
+		end
+	end)
+
+	-- 필요하면 내부 프레임 Visible도 동기화(옵션)
+	if inner and inner:IsA("GuiObject") then
+		inner:GetPropertyChangedSignal("Visible"):Connect(function()
+			-- 여기서 Visible을 잠금 기준으로 쓰고 싶다면 추가 로직 작성
+			-- 지금은 ScreenGui.Enabled만 기준으로 삼음
+		end)
+	end
+end
+
+-- 외부 이벤트 제어
+HotbarLock.Event:Connect(function(lock)
+	if lock then
+		startGuard()
+		-- GUI도 끄기(양방향 반영)
+		local sg = select(1, getGuiHandles(2))
+		if sg and sg.Enabled ~= false then
+			ignoreGuiChange = true
+			sg.Enabled = false
+			ignoreGuiChange = false
+		end
+	else
+		stopGuard()
+		local sg = select(1, getGuiHandles(2))
+		if sg and sg.Enabled ~= true then
+			ignoreGuiChange = true
+			sg.Enabled = true
+			ignoreGuiChange = false
+		end
+	end
+end)
+
+-- 휴머노이드 Attribute 제어(서버/다른 로컬에서 설정 가능)
+local function hookHumanoidAttr()
+	local hum = getHumanoid()
+	hum:GetAttributeChangedSignal("HotbarLocked"):Connect(function()
+		local want = hum:GetAttribute("HotbarLocked") and true or false
+		if want then
+			startGuard()
+			local sg = select(1, getGuiHandles(2))
+			if sg then
+				ignoreGuiChange = true; sg.Enabled = false; ignoreGuiChange = false
+			end
+		else
+			stopGuard()
+			local sg = select(1, getGuiHandles(2))
+			if sg then
+				ignoreGuiChange = true; sg.Enabled = true; ignoreGuiChange = false
+			end
+		end
+	end)
+end
+
+-- 리스폰 대응
+LOCAL.CharacterAdded:Connect(function()
+	-- 캐릭터 바뀌면 가드 재부착
+	if guardActive then
+		task.defer(function()
+			attachRealtimeGuards()
+			forceUnequipAll()
+		end)
+	end
+	task.defer(hookHumanoidAttr)
+end)
+
+-- 초기 바인딩
+task.defer(function()
+	hookGuiSignals()
+	hookHumanoidAttr()
+	-- 초기 상태: 현재 GUI 상태 기준
+	local sg = select(1, getGuiHandles(2))
+	if sg then
+		if sg.Enabled == false then startGuard() else stopGuard() end
+	end
+end)
