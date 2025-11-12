@@ -1,0 +1,313 @@
+-- LocalScript — PlayerGui.Backpack.Backpack (Custom Hotbar, fixed)
+-- 반격 중 임시 폴더 이동/복귀 인식 + 숫자키 선택 안정화
+
+local SG = game:GetService("StarterGui")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+
+SG:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+
+local Player = Players.LocalPlayer
+local BackpackFrame = script.Parent
+local GUI = BackpackFrame.Parent.Parent
+local Container = BackpackFrame.Container
+
+local Backpack = Player:WaitForChild("Backpack")
+local Character = Player.Character or Player.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+
+-- ===== 내부 상태 =====
+local NumberOfSlots = 0
+local Slots = {}                 -- [Slot(Frame)] = Button
+local SlotTracker = {}           -- [Button] = Slot(Frame)
+local ToolRecord = {}            -- [Tool] = Button
+local InToolRecord = {}          -- [Button] = Tool
+local Equipped = nil
+local CurrentSlot = nil
+local Holding = nil
+local HoldStart = 0
+local MoveCon
+local HoldDeb = false
+
+local MouseButton1 = Enum.UserInputType.MouseButton1
+local NulPos = UDim2.new(.5,0,.5,0)
+
+-- ===== 유틸 =====
+local function IsMovement(inputType)
+	return inputType == Enum.UserInputType.MouseMovement or inputType == Enum.UserInputType.Touch
+end
+
+local function isInBackpack(tool)
+	return tool and tool:IsDescendantOf(Backpack)
+end
+
+local function ReindexSlots()
+	-- 프레임만 모으기
+	local frames = {}
+	for _,v in ipairs(Container:GetChildren()) do
+		if v:IsA("Frame") then
+			table.insert(frames, v)
+		end
+	end
+	-- 숫자 기준 정렬
+	table.sort(frames, function(a,b)
+		local na = tonumber(a.Name) or math.huge
+		local nb = tonumber(b.Name) or math.huge
+		return na < nb
+	end)
+	for i,slot in ipairs(frames) do
+		slot.Name = tostring(i)
+		slot.LayoutOrder = i
+	end
+	NumberOfSlots = #frames
+end
+
+local function nextSlotIndex()
+	local c = 0
+	for _,v in ipairs(Container:GetChildren()) do
+		if v:IsA("Frame") then c += 1 end
+	end
+	return c + 1
+end
+
+-- ===== 슬롯/버튼 생성 =====
+local SlotTemplate = script:WaitForChild("Slot")
+
+local function CreateSlot()
+	local new = SlotTemplate:Clone()
+	local idx = nextSlotIndex()
+	new.Name = tostring(idx)
+	new.LayoutOrder = idx
+	new.MouseEnter:Connect(function()
+		CurrentSlot = new
+	end)
+	new.MouseLeave:Connect(function()
+		if CurrentSlot == new then
+			if UIS.TouchEnabled then task.wait() end
+			CurrentSlot = nil
+		end
+	end)
+	new.Parent = Container
+	ReindexSlots()
+	return new
+end
+
+local function RemoveSlot(Slot)
+	if not Slot or not Slot.Parent then return end
+	Slot:Destroy()
+	ReindexSlots()
+end
+
+local function CreateToolSlot(Tool)
+	local new = script:WaitForChild("Button"):Clone()
+	local Texture = Tool.TextureId
+	if Texture and Texture ~= "" then
+		new.ImageLabel.Image = Texture
+		new.ImageLabel.Visible = true
+	else
+		new.Label.Text = string.upper(Tool.Name)
+	end
+	new.MouseButton1Down:Connect(function()
+		if not HoldDeb then
+			HoldDeb = true
+			if not Holding and not MoveCon then
+				HoldStart = tick()
+				local n = HoldStart
+				Holding = new
+				task.wait(0.02)
+				if n == HoldStart and Holding == new then
+					MoveCon = UIS.InputChanged:Connect(function(input)
+						if Holding and Holding == new then
+							if IsMovement(input.UserInputType) then
+								local pos = input.Position
+								new.Parent = GUI
+								new.Position = UDim2.new(0, pos.X, 0, pos.Y + 32)
+							end
+						else
+							new.Position = NulPos
+							if MoveCon then MoveCon:Disconnect() MoveCon = nil end
+						end
+					end)
+				end
+			end
+			task.wait(0.1)
+			HoldDeb = false
+		end
+	end)
+	return new
+end
+
+-- ===== 장착 처리 =====
+local function Equip(Tool)
+	if not Tool then return end
+	if Equipped and Equipped == Tool then
+		Humanoid:UnequipTools()
+	elseif Equipped then
+		Humanoid:UnequipTools()
+		task.wait(0.05)
+		Humanoid:EquipTool(Tool)
+	else
+		Humanoid:EquipTool(Tool)
+	end
+end
+
+local function OnHoldEnd()
+	local new = Holding
+	if new then
+		Holding = nil
+		if MoveCon then MoveCon:Disconnect() MoveCon = nil end
+		local dt = tick() - HoldStart
+		local OldSlot, CS = SlotTracker[new], CurrentSlot
+		if (OldSlot and CS == OldSlot) then
+			new.Parent = CS
+			local Tool = InToolRecord[new]
+			Equip(Tool)
+		elseif dt >= .02 then
+			if CS then
+				local old = Slots[CS]
+				if old then
+					local last = SlotTracker[new]
+					if last then
+						SlotTracker[old] = last
+						old.Parent = last
+						Slots[last] = old
+					else
+						warn("Backpack: Slot lost")
+					end
+				end
+				SlotTracker[new] = CS
+				Slots[CS] = new
+				new.Parent = CS
+			else
+				if Equipped and Equipped == InToolRecord[new] then
+					Humanoid:UnequipTools()
+				end
+				new.Parent = OldSlot
+			end
+		end
+		new.Position = NulPos
+	end
+end
+
+UIS.InputEnded:Connect(function(k)
+	if k.UserInputType == MouseButton1 then
+		OnHoldEnd()
+	end
+end)
+UIS.TouchEnded:Connect(OnHoldEnd)
+
+-- ===== 슬롯 매핑 =====
+local function Add(Tool, btn)
+	ToolRecord[Tool] = btn
+	InToolRecord[btn] = Tool
+
+	local Slot = CreateSlot()
+	Slots[Slot] = btn
+	SlotTracker[btn] = Slot
+	btn.Parent = Slot
+
+	-- Parent 변경 추적: Backpack 트리 밖 → 제거, 루트 복귀 → 재생성
+	Tool:GetPropertyChangedSignal("Parent"):Connect(function()
+		local parent = Tool.Parent
+
+		-- A) Backpack 트리 밖이고(Character에도 아님) → 슬롯/버튼 제거
+		if (not isInBackpack(Tool)) and parent ~= Character then
+			local b = ToolRecord[Tool]
+			local old = b and SlotTracker[b]
+			if old then
+				Slots[old] = nil
+				SlotTracker[b] = nil
+			end
+			if b then b:Destroy() end
+			ToolRecord[Tool] = nil
+			if old then RemoveSlot(old) end
+			return
+		end
+
+		-- B) Backpack 하위에 여전히 있음 → 삭제하지 않음
+		--    루트(Parent == Backpack)로 복귀했고 버튼/슬롯이 없다면 재생성/재매핑
+		if parent == Backpack then
+			if not ToolRecord[Tool] then
+				local nb = CreateToolSlot(Tool)
+				Add(Tool, nb)
+			else
+				local b = ToolRecord[Tool]
+				if b and not SlotTracker[b] then
+					local s = CreateSlot()
+					Slots[s] = b
+					SlotTracker[b] = s
+					b.Parent = s
+				end
+			end
+		end
+	end)
+end
+
+-- 초기 로딩
+for _,Tool in ipairs(Backpack:GetDescendants()) do
+	if Tool.ClassName == "Tool" and not ToolRecord[Tool] then
+		local btn = CreateToolSlot(Tool)
+		Add(Tool, btn)
+	end
+end
+
+-- Backpack 트리로 '처음' 들어오는 툴(외부→Backpack)만 잡는다
+Backpack.DescendantAdded:Connect(function(Tool)
+	if Tool.ClassName == "Tool" and not ToolRecord[Tool] then
+		local btn = CreateToolSlot(Tool)
+		Add(Tool, btn)
+	end
+end)
+
+-- 캐릭터 툴 장착/해제 시 애니 표시
+Character.ChildAdded:Connect(function(tool)
+	if tool.ClassName == "Tool" and not Equipped then
+		Equipped = tool
+		local slotBtn = ToolRecord[tool]
+		if not slotBtn then
+			slotBtn = CreateToolSlot(tool)
+			Add(tool, slotBtn)
+		end
+		local anim = slotBtn:FindFirstChild("Anim")
+		if anim then
+			TweenService:Create(anim, TweenInfo.new(.1), {Size = UDim2.new(1,0,1,0)}):Play()
+		end
+	end
+end)
+
+Character.ChildRemoved:Connect(function(tool)
+	if Equipped == tool then
+		Equipped = nil
+		local slotBtn = ToolRecord[tool]
+		if slotBtn then
+			local anim = slotBtn:FindFirstChild("Anim")
+			if anim then
+				TweenService:Create(anim, TweenInfo.new(.1), {Size = UDim2.new(0,0,0,0)}):Play()
+			end
+		end
+	end
+end)
+
+-- 숫자키 바인딩 (프레임 이름 1..N, 문자열로 조회)
+local Binds = {
+	Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five,
+	Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine, Enum.KeyCode.Zero
+}
+
+UIS.InputBegan:Connect(function(k, g)
+	if g then return end
+	for i = 1, NumberOfSlots do
+		if k.KeyCode == Binds[i] then
+			local Slot = Container:FindFirstChild(tostring(i))
+			if Slot then
+				local btn = Slots[Slot]
+				if btn then
+					local Tool = InToolRecord[btn]
+					Equip(Tool)
+				end
+			end
+			break
+		end
+	end
+end)
