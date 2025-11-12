@@ -1,0 +1,389 @@
+-- LocalScript — StarterCharacterScripts/SlideAbility.client.lua
+-- 슬라이드 + 쿨다운 + 사운드 + 서버 무적 처리
+-- 슬라이드 중 툴 임시 해제 후 재장착
+-- 쿨다운 바(DashStatus) 표시
+-- 슬라이드 시 플레이어의 Stamina(NumberValue)를 10 감소 (이중 확정)
+-- 추가: "애니메이션 재생 중" 절대 장착 금지(핫바/단축키/재장착/자동장착 전부 차단)
+-- 변경: 구르기 애니메이션 사전 로드 + 단일 트랙 재사용
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local ContentProvider = game:GetService("ContentProvider")
+local ContextActionService = game:GetService("ContextActionService")
+
+local player   = Players.LocalPlayer
+local char     = script.Parent
+local humanoid = char:WaitForChild("Humanoid")
+local hrp      = char:WaitForChild("HumanoidRootPart")
+local backpack = player:WaitForChild("Backpack")
+
+-- ===== Animation (사전 로드 + 단일 트랙) =====
+local slideAnim = Instance.new("Animation")
+slideAnim.AnimationId = "rbxassetid://84796266527379" -- 119277388755000 구르기
+
+pcall(function()
+	ContentProvider:PreloadAsync({slideAnim})
+end)
+
+local slideTrack = humanoid:LoadAnimation(slideAnim)
+slideTrack.Priority = Enum.AnimationPriority.Action
+local slideStoppedConn: RBXScriptConnection? = nil
+-- ============================================
+
+local keybind      = Enum.KeyCode.Z
+local canslide     = true
+local cooldown     = 5
+local STAMINA_COST = 10
+
+local DISABLE_BACKPACK_COREGUI = true
+
+-- 최신 Stamina(NumberValue) 참조 확보
+local function getStamina(timeout)
+	timeout = timeout or 2
+	local s = player.plrstatus:FindFirstChild("Stamina") or player.plrstatus:WaitForChild("Stamina", timeout)
+	return (s and s:IsA("NumberValue")) and s or nil
+end
+
+-- 차감 이중 확정
+local function reduceStamina(cost)
+	local s = getStamina()
+	if not s then return false end
+	local before = tonumber(s.Value) or 0
+	if before < cost then return false end
+	local target = math.max(before - cost, 0)
+	s.Value = target
+	task.defer(function()
+		local s2 = getStamina()
+		if s2 and math.abs((tonumber(s2.Value) or 0) - target) > 1e-3 then
+			s2.Value = target
+		end
+	end)
+	return true
+end
+
+-- 서버 무적 RemoteEvent
+local remote = ReplicatedStorage:FindFirstChild("SlideInvuln")
+if not remote then
+	remote = Instance.new("RemoteEvent")
+	remote.Name = "SlideInvuln"
+	remote.Parent = ReplicatedStorage
+end
+
+-- 사운드
+local slideSound = hrp:FindFirstChild("SlideSound")
+if not slideSound then
+	slideSound = Instance.new("Sound")
+	slideSound.Name = "SlideSound"
+	slideSound.SoundId = "rbxassetid://8042841372"
+	slideSound.Volume = 1.2
+	slideSound.PlaybackSpeed = 1
+	slideSound.Parent = hrp
+end
+
+-- ===== DashStatus UI =====
+local dashFrame, dashStatus, dashTween
+local function bindDashUI()
+	local pg = player:WaitForChild("PlayerGui")
+	local ui = pg:WaitForChild("StaminaUI")
+	dashFrame  = ui:WaitForChild("Frame")
+	dashStatus = dashFrame:WaitForChild("DashStatus")
+	dashStatus.Position = UDim2.new(0, 0, -0.443, 0)
+	dashStatus.Size     = UDim2.new(1, 0, -0.393, 0)
+	dashStatus.Visible  = false
+end
+
+local function setDashRatio(r)
+	if dashStatus and dashStatus.Parent then
+		dashStatus.Size = UDim2.new(math.clamp(r, 0, 1), 0, -0.393, 0)
+	end
+end
+
+local function startCooldownBar(duration)
+	if not dashStatus then bindDashUI() end
+	if not dashStatus then return end
+	if dashTween then dashTween:Cancel() dashTween = nil end
+
+	dashStatus.Visible = true
+	setDashRatio(1)
+
+	dashTween = TweenService:Create(
+		dashStatus,
+		TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+		{ Size = UDim2.new(0, 0, -0.393, 0) }
+	)
+
+	dashTween.Completed:Connect(function()
+		if dashStatus then
+			dashStatus.Visible = false
+			setDashRatio(0)
+		end
+	end)
+
+	dashTween:Play()
+end
+-- =========================
+
+-- ===== 툴 시각 숨김/복원 (클라 전용) =====
+local savedVisual = {}
+
+local function stashAndHideToolVisual(tool)
+	if not tool or not tool:IsA("Tool") then return end
+	if savedVisual[tool] then return end
+	savedVisual[tool] = {}
+	for _, d in ipairs(tool:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(savedVisual[tool], {inst=d, props={
+				ltm = d.LocalTransparencyModifier,
+				shadow = d.CastShadow,
+			}})
+			d.LocalTransparencyModifier = 1
+			d.CastShadow = false
+		elseif d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam") then
+			table.insert(savedVisual[tool], {inst=d, props={enabled = d.Enabled}})
+			d.Enabled = false
+		elseif d:IsA("Light") then
+			table.insert(savedVisual[tool], {inst=d, props={enabled = d.Enabled}})
+			d.Enabled = false
+		end
+	end
+end
+
+local function restoreToolVisual(tool)
+	local list = savedVisual[tool]
+	if not list then return end
+	for _, rec in ipairs(list) do
+		local inst = rec.inst
+		if inst and inst.Parent then
+			if inst:IsA("BasePart") then
+				inst.LocalTransparencyModifier = rec.props.ltm or 0
+				inst.CastShadow = rec.props.shadow ~= nil and rec.props.shadow or true
+			elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Light") then
+				if rec.props.enabled ~= nil then
+					inst.Enabled = rec.props.enabled
+				end
+			end
+		end
+	end
+	savedVisual[tool] = nil
+end
+-- ======================================
+
+-- ===== 슬라이드 이동 (XZ만 강제, Y는 보존) =====
+local SLIDE_INITIAL_SPEED = 100
+local SLIDE_DURATION      = 0.75
+local SLIDE_DECAY_RATE    = 2.8
+local REQUIRE_GROUND      = false
+
+local function doSlideImpulse()
+	local dir = humanoid.MoveDirection
+	if dir.Magnitude < 0.05 then
+		dir = hrp.CFrame.LookVector
+	end
+	dir = Vector3.new(dir.X, 0, dir.Z)
+	if dir.Magnitude < 1e-3 then return end
+	dir = dir.Unit
+
+	if REQUIRE_GROUND and humanoid.FloorMaterial == Enum.Material.Air then
+		return
+	end
+
+	local prevAutoRotate = humanoid.AutoRotate
+	humanoid.AutoRotate = false
+	hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir)
+
+	local t0 = time()
+	while time() - t0 < SLIDE_DURATION do
+		if REQUIRE_GROUND and humanoid.FloorMaterial == Enum.Material.Air then
+			break
+		end
+		local t = time() - t0
+		local speed = SLIDE_INITIAL_SPEED * math.exp(-SLIDE_DECAY_RATE * t)
+		local vel = hrp.AssemblyLinearVelocity
+		local newVel = Vector3.new(dir.X * speed, vel.Y, dir.Z * speed)
+		hrp.AssemblyLinearVelocity = newVel
+		RunService.Heartbeat:Wait()
+	end
+
+	humanoid.AutoRotate = prevAutoRotate
+end
+-- ======================================
+
+-- ===== 절대 장착 차단 가드 (애니메이션 재생 중) =====
+local guardActive = false
+local conns: {RBXScriptConnection} = {}
+local renderStepName = "SlideGuard_UnequipLoop"
+
+local function blockInput(actionName, inputState, inputObject)
+	return Enum.ContextActionResult.Sink
+end
+
+local function bindEquipInputs()
+	-- 숫자 단축키/툴 관련 입력 전부 싱크
+	local keys = {
+		Enum.KeyCode.Zero, Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four,
+		Enum.KeyCode.Five, Enum.KeyCode.Six, Enum.KeyCode.Seven, Enum.KeyCode.Eight, Enum.KeyCode.Nine,
+		Enum.KeyCode.Backspace, -- 슬롯 비우기
+		Enum.KeyCode.E, -- 일부 사용자 정의 E-장착 방지(게임에 따라)
+		Enum.KeyCode.Q, -- 퀵슬롯류
+	}
+	for i, key in ipairs(keys) do
+		ContextActionService:BindActionAtPriority(
+			"SlideBlock_"..tostring(i),
+			blockInput,
+			false,
+			Enum.ContextActionPriority.High.Value,
+			key
+		)
+	end
+end
+
+local function unbindEquipInputs()
+	for i = 1, 20 do
+		ContextActionService:UnbindAction("SlideBlock_"..tostring(i))
+	end
+end
+
+local function forceToolToBackpack(inst)
+	if inst and inst:IsA("Tool") then
+		inst.Parent = backpack
+		humanoid:UnequipTools()
+	end
+end
+
+local function startAbsoluteGuard()
+	if guardActive then return end
+	guardActive = true
+
+	if DISABLE_BACKPACK_COREGUI then
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+	end
+
+	bindEquipInputs()
+
+	-- 캐릭터에 Tool이 붙으면 즉시 되돌리기
+	table.insert(conns, char.ChildAdded:Connect(forceToolToBackpack))
+	-- 혹시 모를 후속 이동도 대비하여 DescendantAdded에서 Tool 감시
+	table.insert(conns, char.DescendantAdded:Connect(function(inst)
+		if inst:IsA("Tool") and inst.Parent == char then
+			forceToolToBackpack(inst)
+		end
+	end))
+	-- Backpack 내부 Tool이 장착으로 이동하려 할 때 즉시 회수
+	table.insert(conns, backpack.ChildRemoved:Connect(function(inst)
+		-- 장착으로 넘어간 흔적이면 곧바로 회수(다음 프레임 보정)
+		if inst and inst:IsA("Tool") then
+			task.defer(function()
+				if inst.Parent == char then
+					forceToolToBackpack(inst)
+				end
+			end)
+		end
+	end))
+	-- 매 프레임 강제 해제(최후의 보루)
+	RunService:BindToRenderStep(renderStepName, Enum.RenderPriority.Input.Value + 100, function()
+		if not guardActive then return end
+		-- 캐릭터에 붙은 모든 Tool 밀어내기
+		for _, child in ipairs(char:GetChildren()) do
+			if child:IsA("Tool") then
+				forceToolToBackpack(child)
+			end
+		end
+		humanoid:UnequipTools()
+	end)
+end
+
+local function stopAbsoluteGuard()
+	if not guardActive then return end
+	guardActive = false
+
+	unbindEquipInputs()
+
+	if DISABLE_BACKPACK_COREGUI then
+		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
+	end
+
+	for _, c in ipairs(conns) do
+		if c then c:Disconnect() end
+	end
+	conns = {}
+
+	pcall(function()
+		RunService:UnbindFromRenderStep(renderStepName)
+	end)
+end
+-- ======================================
+
+-- ===== 입력 처리 =====
+UIS.InputBegan:Connect(function(input, gp)
+	if gp or not canslide then return end
+	if input.KeyCode ~= keybind then return end
+
+	if not reduceStamina(STAMINA_COST) then
+		return
+	end
+
+	canslide = false
+
+	local equippedTool = char:FindFirstChildOfClass("Tool")
+	if equippedTool then
+		stashAndHideToolVisual(equippedTool)
+		humanoid:UnequipTools()
+	end
+
+	local h = script:FindFirstChild("Highlight")
+	if h then
+		local clone = h:Clone()
+		clone.Parent = char
+		Debris:AddItem(clone, 0.4)
+	end
+
+	-- 애니메이션 재생 동안 절대 장착 금지
+	if slideTrack.IsPlaying then
+		slideTrack:Stop()
+	end
+	slideTrack:Play()
+	startAbsoluteGuard()
+
+	if slideStoppedConn then
+		slideStoppedConn:Disconnect()
+		slideStoppedConn = nil
+	end
+	slideStoppedConn = slideTrack.Stopped:Connect(function()
+		-- 애니가 멈추는 즉시 해제
+		stopAbsoluteGuard()
+	end)
+
+	slideSound:Play()
+	remote:FireServer(true)
+	doSlideImpulse()
+	remote:FireServer(false)
+
+	-- 애니가 아직 재생 중이면 정지 → 가드 종료 트리거
+	if slideTrack.IsPlaying then
+		slideTrack:Stop()
+	end
+	-- 잔여 프레임 버퍼(혹시 모를 지연 대비)
+	task.wait(0.03)
+	stopAbsoluteGuard()
+
+	if equippedTool and equippedTool.Parent == backpack then
+		RunService.Heartbeat:Wait()
+		if equippedTool.Parent == backpack then
+			humanoid:EquipTool(equippedTool)
+		end
+	end
+	if equippedTool then
+		restoreToolVisual(equippedTool)
+	end
+
+	startCooldownBar(cooldown)
+	task.wait(cooldown)
+	canslide = true
+end)
+
+bindDashUI()
