@@ -1,0 +1,22 @@
+-- LocalScript — StarterPlayerScripts/AlwaysHideBackpack.lua
+-- 언제나 CoreGui Backpack을 숨김 (켜도 즉시 다시 비활성화)
+
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+
+-- 초기 비활성
+pcall(function()
+	StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+end)
+
+-- 프레임 단위로 감시해서 켜지면 다시 끔
+RunService.Heartbeat:Connect(function()
+	local ok, enabled = pcall(function()
+		return StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Backpack)
+	end)
+	if ok and enabled then
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+		end)
+	end
+end)
